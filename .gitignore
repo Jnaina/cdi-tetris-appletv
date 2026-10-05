@@ -1,0 +1,11 @@
+# allow-list only: no disc images, BIOS/ROMs, emulator cores, RetroArch tree or build output
+*
+!.gitignore
+!README.md
+!build-and-install.sh
+!make_art_cdi.py
+!ents.plist.template
+!patches/
+!patches/ui_cocoatouch-cdi.patch
+!preview/
+!preview/icon.png

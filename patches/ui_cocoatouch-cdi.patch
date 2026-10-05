@@ -1,0 +1,129 @@
+--- a/ui/drivers/ui_cocoatouch.m
++++ b/ui/drivers/ui_cocoatouch.m
+@@ -13,6 +13,8 @@
+  * If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "../../gfx/video_driver.h"
++extern void apple_input_keyboard_event(bool down, unsigned code, uint32_t character, uint32_t mod, unsigned device);
+ #include <stdint.h>
+ #include <stddef.h>
+ #include <stdlib.h>
+@@ -779,10 +781,37 @@
+ #endif
+ 
+    char arguments[]   = "retroarch";
+-   char       *argv[] = {arguments,   NULL};
++   char       *argv[] = {arguments, NULL, NULL, NULL, NULL};
+    int argc           = 1;
+    apple_platform     = self;
+ 
++#ifdef PULSTAR_AUTOLOAD
++   {
++      NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
++      NSString *core       = [bundlePath stringByAppendingPathComponent:@"Frameworks/same.cdi.libretro.framework/same.cdi.libretro"];
++      NSString *rom        = [bundlePath stringByAppendingPathComponent:@"roms/Tetris (USA, Europe).cue"];
++      NSString *caches     = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
++      NSString *cfgDir     = [caches stringByAppendingPathComponent:@"RetroArch/config"];
++      NSString *cfg        = [cfgDir stringByAppendingPathComponent:@"retroarch.cfg"];
++      [[NSFileManager defaultManager] createDirectoryAtPath:cfgDir withIntermediateDirectories:YES attributes:nil error:nil];
++      NSString *sysDir     = [bundlePath stringByAppendingPathComponent:@"system"];
++      NSString *saveDir    = [caches stringByAppendingPathComponent:@"RetroArch/saves"];
++      NSString *stateDir   = [caches stringByAppendingPathComponent:@"RetroArch/states"];
++      NSString *optDir     = [cfgDir stringByAppendingPathComponent:@"SAME_CDI"];
++      [[NSFileManager defaultManager] createDirectoryAtPath:saveDir withIntermediateDirectories:YES attributes:nil error:nil];
++      [[NSFileManager defaultManager] createDirectoryAtPath:stateDir withIntermediateDirectories:YES attributes:nil error:nil];
++      [[NSFileManager defaultManager] createDirectoryAtPath:optDir withIntermediateDirectories:YES attributes:nil error:nil];
++      /* speed-first core options: the core's own throttle is off (RetroArch paces it), PAL timing (50 Hz) is the lighter load */
++      [@"same_cdi_throttle = \"disabled\"\nsame_cdi_video_standard = \"pal\"\nsame_cdi_cpu_overclock = \"default\"\nsame_cdi_nvram_saves = \"enabled\"\nsame_cdi_auto_save = \"disabled\"\nsame_cdi_alternate_renderer = \"disabled\"\nsame_cdi_mouse_enable = \"disabled\"\nsame_cdi_buttons_profiles = \"enabled\"\n" writeToFile:[optDir stringByAppendingPathComponent:@"SAME_CDI.opt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
++      NSString *cfgText    = [NSString stringWithFormat:@"%@system_directory = \"%@\"\nsavefile_directory = \"%@\"\nsavestate_directory = \"%@\"\n", @"video_driver = \"metal\"\nvideo_vsync = \"true\"\nvideo_max_swapchain_images = \"2\"\nvideo_threaded = \"false\"\nvideo_smooth = \"false\"\naudio_driver = \"coreaudio3\"\naudio_latency = \"128\"\npause_nonactive = \"false\"\nvideo_frame_delay_auto = \"false\"\nfps_show = \"false\"\nmenu_driver = \"rgui\"\nrewind_enable = \"false\"\nrun_ahead_enabled = \"false\"\nconfig_save_on_exit = \"false\"\nquit_press_twice = \"false\"\ninput_overlay_enable = \"false\"\n", sysDir, saveDir, stateDir];
++      [cfgText writeToFile:cfg atomically:YES encoding:NSUTF8StringEncoding error:nil];
++      argv[1] = strdup("-L");
++      argv[2] = strdup([core UTF8String]);
++      argv[3] = strdup([rom UTF8String]);
++      argc    = 4;
++   }
++#endif
++
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"restore_default_config"])
+    {
+       [NSUserDefaults.standardUserDefaults setBool:NO forKey:@"restore_default_config"];
+@@ -825,6 +854,78 @@
+ 
+    [self showGameView];
+ 
++#ifdef PULSTAR_AUTOLOAD
++   {
++      /* benchmark logger: emulated frames per second to stderr and Caches/fps.log */
++      __block uint64_t lastFrames = 0;
++      __block CFAbsoluteTime lastT = CFAbsoluteTimeGetCurrent();
++      NSString *logPath = [[NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject] stringByAppendingPathComponent:@"fps.log"];
++      [[NSFileManager defaultManager] removeItemAtPath:logPath error:nil];
++      [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES block:^(NSTimer *t) {
++         video_driver_state_t *vs = video_state_get_ptr();
++         uint64_t f = vs->frame_count;
++         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
++         NSString *line = [NSString stringWithFormat:@"[FPSLOG] frames=%llu fps=%.1f\n", f, (double)(f - lastFrames) / (now - lastT)];
++         fputs([line UTF8String], stderr); fflush(stderr);
++         FILE *fp = fopen([logPath UTF8String], "a"); if (fp) { fputs([line UTF8String], fp); fclose(fp); }
++         lastFrames = f; lastT = now;
++      }];
++      /* The Philips CD-i player menu waits for PLAY CD-I. Watch the picture: when the grey player menu (or its
++         grey loading screen) is showing, tap A (keyboard x) once, and once more 30 s later if it is still grey.
++         At most two taps in total, and everything stops as soon as a real controller button is pressed or
++         after 7 minutes, so nothing is ever injected into the game itself. */
++      __block int tapsDone = 0;
++      __block BOOL stopped = NO;
++      __block CFAbsoluteTime lastTap = 0;
++      CFAbsoluteTime startT = CFAbsoluteTimeGetCurrent();
++      [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
++         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
++         if (stopped || tapsDone >= 2 || now - startT > 420.0) { [t invalidate]; return; }
++         for (GCController *c in [GCController controllers])
++         {
++            GCExtendedGamepad *g = c.extendedGamepad;
++            if (g && (g.buttonA.isPressed || g.buttonB.isPressed || g.buttonX.isPressed || g.buttonY.isPressed
++                      || g.leftShoulder.isPressed || g.rightShoulder.isPressed || g.dpad.up.isPressed || g.dpad.down.isPressed
++                      || g.dpad.left.isPressed || g.dpad.right.isPressed || g.buttonMenu.isPressed))
++            { stopped = YES; [t invalidate]; return; }
++            if (c.microGamepad.buttonA.isPressed) { stopped = YES; [t invalidate]; return; }
++         }
++         video_driver_state_t *vs = video_state_get_ptr();
++         const uint8_t *px = (const uint8_t *)vs->frame_cache_data;
++         unsigned w = vs->frame_cache_width, h = vs->frame_cache_height;
++         if (!px || w < 16 || h < 16 || (intptr_t)px == -1) return;
++         int gray = 0, total = 0; long bright = 0;
++         for (int gy = 0; gy < 12; gy++)
++            for (int gx = 0; gx < 16; gx++)
++            {
++               unsigned x = (w * (2 * gx + 1)) / 32, y = (h * (2 * gy + 1)) / 24;
++               int r, gg, b;
++               if (vs->pix_fmt == RETRO_PIXEL_FORMAT_XRGB8888)
++               { const uint8_t *q = px + y * vs->frame_cache_pitch + x * 4; b = q[0]; gg = q[1]; r = q[2]; }
++               else
++               { uint16_t v = *(const uint16_t *)(px + y * vs->frame_cache_pitch + x * 2);
++                 if (vs->pix_fmt == RETRO_PIXEL_FORMAT_RGB565) { r = (v >> 11) << 3; gg = ((v >> 5) & 63) << 2; b = (v & 31) << 3; }
++                 else { r = ((v >> 10) & 31) << 3; gg = ((v >> 5) & 31) << 3; b = (v & 31) << 3; } }
++               int mx = MAX(r, MAX(gg, b)), mn = MIN(r, MIN(gg, b));
++               total++; bright += (r + gg + b) / 3;
++               if (mx - mn < 24) gray++;
++            }
++         double ratio = (double)gray / total, avg = (double)bright / total;
++         BOOL greyScreen = ratio >= 0.75 && avg > 90 && avg < 215;
++         NSString *line = [NSString stringWithFormat:@"[AUTOPRESS] t=%.0f gray=%.2f avg=%.0f taps=%d\n", now - startT, ratio, avg, tapsDone];
++         FILE *fp = fopen([logPath UTF8String], "a"); if (fp) { fputs([line UTF8String], fp); fclose(fp); }
++         if (greyScreen && (tapsDone == 0 || now - lastTap >= 30.0))
++         {
++            tapsDone++; lastTap = now;
++            apple_input_keyboard_event(true, 27, 0, 0, RETRO_DEVICE_KEYBOARD);
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++               apple_input_keyboard_event(false, 27, 0, 0, RETRO_DEVICE_KEYBOARD);
++            });
++         }
++      }];
++   }
++#endif
++
+    rarch_main(argc, argv, NULL);
+ 
+ #ifdef HAVE_KSCRASH
